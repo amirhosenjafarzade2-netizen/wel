@@ -12,11 +12,10 @@ import lightgbm as lgb
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Input
-import plotly.express as px
-import plotly.graph_objects as go
+import matplotlib.pyplot as plt
 from scipy.optimize import fsolve
 try:
-    from config import PRODUCTION_RATES, GITHUB_URL
+    from config import PRODUCTION_RATES, GITHUB_URL, COLORS
     from utils import setup_logging, polynomial
     from random_point_generator import generate_df
     from validators import validate_conduit_size, validate_production_rate, get_valid_options, get_valid_glr_range, validate_glr, validate_positive_integer
@@ -269,6 +268,7 @@ def calculate_p2_finder(reference_data, p1, D, conduit_size, production_rate, gl
         glrs = [entry['glr'] for entry in filtered_data]
         if glr in glrs:
             coeffs = next(entry['coefficients'] for entry in filtered_data if entry['glr'] == glr)
+            interpolation_status = 'exact'
         else:
             glrs.sort()
             if glr < glrs[0] or glr > glrs[-1]:
@@ -284,18 +284,19 @@ def calculate_p2_finder(reference_data, p1, D, conduit_size, production_rate, gl
             weight = (glr - lower_glr) / (upper_glr - lower_glr)
             coeffs = {key: lower_coeffs[key] + (upper_coeffs[key] - lower_coeffs[key]) * weight
                       for key in lower_coeffs}
+            interpolation_status = 'interpolated'
         
         # Calculate y1 = polynomial(p1)
         y1 = polynomial(p1, coeffs)
         if not np.isfinite(y1) or y1 < 0 or y1 > 31000:
             logger.error(f"Invalid y1={y1} for p1={p1}")
-            return None
+            return None, None, None
         
         # Calculate y2 = y1 + D
         y2 = y1 + D
         if y2 > 31000:
             logger.error(f"y2={y2} exceeds max depth 31000")
-            return None
+            return None, None, None
         
         # Solve polynomial(p2) = y2 for p2
         def root_function(p2):
@@ -305,11 +306,133 @@ def calculate_p2_finder(reference_data, p1, D, conduit_size, production_rate, gl
         p2 = fsolve(root_function, p2_guess, maxfev=20000)[0]
         if not np.isfinite(p2) or p2 < 0 or p2 > 4000:
             logger.error(f"Invalid p2={p2}")
-            return None
+            return None, None, None
         
-        return p2
+        return p2, y1, interpolation_status
     except Exception as e:
         logger.error(f"Error in p2 Finder calculation: {str(e)}")
+        return None, None, None
+
+def plot_p2_comparison(p1, y1, p2_ml, p2_finder, D, coeffs, glr_input, interpolation_status, production_rate, mode='color'):
+    """
+    Plot pressure vs. depth curve with ML and p2 Finder points, adapted from plot_results.
+    
+    Parameters:
+    - p1, y1: Wellhead pressure and corresponding depth
+    - p2_ml, p2_finder: ML-predicted and p2 Finder calculated p2
+    - D: Well length in feet
+    - coeffs: Polynomial coefficients
+    - glr_input: Gas-Liquid Ratio
+    - interpolation_status: 'exact' or 'interpolated'
+    - production_rate: Production rate in stb/day
+    - mode: 'color' or 'bw' for colorful or black-and-white plots
+    
+    Returns:
+    - Matplotlib figure object or None if plotting fails
+    """
+    logger.info(f"Plotting p2 comparison: p1={p1:.2f}, y1={y1:.2f}, p2_ml={p2_ml:.2f}, p2_finder={p2_finder:.2f}, Q0={production_rate}, GLR={glr_input}")
+    
+    try:
+        # Calculate y2 for both p2 values
+        y2_finder = y1 + D
+        y2_ml = polynomial(p2_ml, coeffs)
+        if not np.isfinite(y2_ml) or y2_ml < 0 or y2_ml > 31000:
+            logger.error(f"Invalid y2_ml={y2_ml} for p2_ml={p2_ml}")
+            return None
+        
+        # Initialize figure
+        fig, ax = plt.subplots(figsize=(10, 6), dpi=300)
+        fig.patch.set_facecolor('#F5F5F5' if mode == 'color' else 'white')
+        ax.set_facecolor('#F5F5F5' if mode == 'color' else 'white')
+        
+        # Generate pressure points for the curve
+        p1_full = np.linspace(0, 4000, 100)
+        y1_full = []
+        crossing_x = None
+        max_iterations = 100
+        iteration = 0
+        
+        for p in p1_full:
+            if iteration >= max_iterations:
+                logger.warning("Reached maximum iterations in depth calculation")
+                break
+            y = polynomial(p, coeffs)
+            if np.isfinite(y) and y <= 31000:
+                y1_full.append(y)
+            else:
+                if crossing_x is None and len(y1_full) > 0:
+                    def root_fn(x):
+                        return polynomial(x, coeffs) - 31000
+                    try:
+                        mid_guess = p1_full[max(0, len(y1_full) - 1)]
+                        candidate = np.linspace(mid_guess, p, 10)[5]
+                        if 0 <= candidate <= 4000:
+                            crossing_x = candidate
+                            y1_full.append(31000)
+                            break
+                    except Exception as e:
+                        logger.debug(f"Root finding failed: {str(e)}")
+                        crossing_x = p1_full[len(y1_full) - 1]
+                        y1_full.append(31000)
+                        break
+                else:
+                    y1_full.append(31000)
+            iteration += 1
+        
+        if len(y1_full) < 2:
+            logger.error("Insufficient valid points for pressure vs. depth plot")
+            plt.close(fig)
+            return None
+        
+        # Plot GLR curve
+        curve_color = COLORS[0] if mode == 'color' else 'black'
+        ax.plot(p1_full[:len(y1_full)], y1_full, color=curve_color, linewidth=2.5,
+                label=f'GLR curve ({interpolation_status.capitalize()}, Q0={production_rate} stb/day, GLR={glr_input})')
+        
+        # Plot data points
+        ax.scatter([p1], [y1], color=curve_color, s=50, label=f'(p1, y1) = ({p1:.2f} psi, {y1:.2f} ft)')
+        ax.scatter([p2_finder], [y2_finder], color=curve_color, s=50, label=f'p2 Finder (p2, y2) = ({p2_finder:.2f} psi, {y2_finder:.2f} ft)')
+        ax.scatter([p2_ml], [y2_ml], color='red' if mode == 'color' else 'gray', s=50, label=f'ML Prediction (p2, y2) = ({p2_ml:.2f} psi, {y2_ml:.2f} ft)')
+        
+        # Plot reference lines
+        ax.plot([p1, p1], [y1, 0], color='red', linewidth=1, label='Connecting Line')
+        ax.plot([p1, 0], [y1, y1], color='red', linewidth=1)
+        ax.plot([p2_finder, p2_finder], [y2_finder, 0], color='red', linewidth=1)
+        ax.plot([p2_finder, 0], [y2_finder, y2_finder], color='red', linewidth=1)
+        ax.plot([p2_ml, p2_ml], [y2_ml, 0], color='red', linewidth=1)
+        ax.plot([p2_ml, 0], [y2_ml, y2_ml], color='red', linewidth=1)
+        ax.plot([0, 0], [y1, y2_finder], color='green', linewidth=4, label=f'Well Length ({D:.2f} ft)')
+        
+        # Configure axes
+        ax.set_xlabel('Gradient Pressure, psi', fontsize=10)
+        ax.set_ylabel('Depth, ft', fontsize=10)
+        ax.set_xlim(0, 4000)
+        ax.set_ylim(0, 31000)
+        ax.grid(True, which='major', color='#D3D3D3' if mode == 'color' else 'black', alpha=0.5)
+        ax.grid(True, which='minor', color='#D3D3D3' if mode == 'color' else 'black', linestyle='-', alpha=0.2 if mode == 'bw' else 0.5)
+        ax.xaxis.set_major_locator(plt.MultipleLocator(1000))
+        ax.xaxis.set_minor_locator(plt.MultipleLocator(200))
+        ax.yaxis.set_major_locator(plt.MultipleLocator(1000))
+        ax.yaxis.set_minor_locator(plt.MultipleLocator(200))
+        ax.xaxis.set_label_position('top')
+        ax.xaxis.set_ticks_position('top')
+        ax.margins(x=0.05, y=0.05)
+        ax.invert_yaxis()
+        
+        # Add legend
+        ax.legend(loc='lower center', bbox_to_anchor=(0.5, -0.3), fontsize=8, frameon=True, edgecolor='black', ncol=1)
+        plt.tight_layout()
+        
+        if len(ax.lines) == 0:
+            logger.error("Empty plot in plot_p2_comparison - closing and returning None")
+            plt.close(fig)
+            return None
+        
+        logger.info("p2 comparison plot generated successfully")
+        return fig
+    except Exception as e:
+        logger.error(f"Failed to plot p2 comparison: {str(e)}")
+        plt.close()
         return None
 
 def run_ml_predictor():
@@ -319,9 +442,8 @@ def run_ml_predictor():
     st.subheader("Mode 6: Bottomhole Pressure Predictor")
     
     # Apply theme from ui.py
-    theme = 'plotly_white'
-    if st.session_state.get('theme', 'light') == 'dark':
-        theme = 'plotly_dark'
+    mode = 'color' if st.session_state.get('theme', 'light') == 'light' else 'bw'
+    if mode == 'bw':
         st.markdown("""
             <style>
                 .stApp {
@@ -455,15 +577,40 @@ def run_ml_predictor():
                 return
             
             # ML Prediction
-            p2_pred = predict_p2(st.session_state.model_pred, st.session_state.scaler_pred, 
-                               pred_p1, pred_D, pred_conduit, pred_prod, pred_glr)
+            p2_ml = predict_p2(st.session_state.model_pred, st.session_state.scaler_pred, 
+                             pred_p1, pred_D, pred_conduit, pred_prod, pred_glr)
             
             # p2 Finder Calculation
-            p2_finder = calculate_p2_finder(st.session_state.reference_data, pred_p1, pred_D,
-                                          pred_conduit, pred_prod, pred_glr)
+            p2_finder, y1, interpolation_status = calculate_p2_finder(st.session_state.reference_data, 
+                                                                    pred_p1, pred_D, pred_conduit, 
+                                                                    pred_prod, pred_glr)
             
-            if p2_pred is not None:
-                st.success(f"ML Predicted p2: {p2_pred:.2f} psi")
+            # Filter coefficients for plotting
+            filtered_data = [
+                entry for entry in st.session_state.reference_data
+                if entry['conduit_size'] == pred_conduit and entry['production_rate'] == pred_prod
+            ]
+            glrs = [entry['glr'] for entry in filtered_data]
+            if pred_glr in glrs:
+                coeffs = next(entry['coefficients'] for entry in filtered_data if entry['glr'] == pred_glr)
+            else:
+                glrs.sort()
+                if pred_glr < glrs[0] or pred_glr > glrs[-1]:
+                    st.error(f"GLR {pred_glr} out of range for plotting.")
+                    return
+                lower_glr = max([g for g in glrs if g <= pred_glr], default=None)
+                upper_glr = min([g for g in glrs if g >= pred_glr], default=None)
+                if lower_glr is None or upper_glr is None:
+                    st.error(f"Cannot interpolate GLR {pred_glr} for plotting.")
+                    return
+                lower_coeffs = next(entry['coefficients'] for entry in filtered_data if entry['glr'] == lower_glr)
+                upper_coeffs = next(entry['coefficients'] for entry in filtered_data if entry['glr'] == upper_glr)
+                weight = (pred_glr - lower_glr) / (upper_glr - lower_glr)
+                coeffs = {key: lower_coeffs[key] + (upper_coeffs[key] - lower_coeffs[key]) * weight
+                          for key in lower_coeffs}
+            
+            if p2_ml is not None:
+                st.success(f"ML Predicted p2: {p2_ml:.2f} psi")
             else:
                 st.error("ML prediction failed.")
             
@@ -473,25 +620,12 @@ def run_ml_predictor():
                 st.error("p2 Finder calculation failed.")
             
             # Plot comparison if both predictions are valid
-            if p2_pred is not None and p2_finder is not None:
-                fig = go.Figure()
-                fig.add_trace(go.Scatter(
-                    x=[pred_p1], y=[p2_pred], mode='markers', name='ML Prediction',
-                    marker=dict(size=12, color='blue')
-                ))
-                fig.add_trace(go.Scatter(
-                    x=[pred_p1], y=[p2_finder], mode='markers', name='p2 Finder',
-                    marker=dict(size=12, color='red')
-                ))
-                fig.update_layout(
-                    title="p2 Comparison: ML Prediction vs p2 Finder",
-                    xaxis_title="Wellhead Pressure (p1, psi)",
-                    yaxis_title="Bottomhole Pressure (p2, psi)",
-                    template=theme,
-                    showlegend=True,
-                    width=600,
-                    height=400
-                )
-                st.plotly_chart(fig)
+            if p2_ml is not None and p2_finder is not None:
+                fig = plot_p2_comparison(pred_p1, y1, p2_ml, p2_finder, pred_D, coeffs, 
+                                       pred_glr, interpolation_status, pred_prod, mode=mode)
+                if fig is not None:
+                    st.pyplot(fig)
+                else:
+                    st.error("Failed to generate p2 comparison plot.")
     else:
         st.warning("Please generate data and train the model before making predictions.")
