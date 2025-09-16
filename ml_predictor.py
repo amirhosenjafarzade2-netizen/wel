@@ -610,12 +610,12 @@ def run_ml_predictor():
                           for key in lower_coeffs}
             
             if p2_ml is not None:
-                st.success(f"ML Predicted p2: {p2_ml:.2f} psi")
+                st.success(f"Machine Learning Predicted Bottomhole Flowing Pressure: {p2_ml:.2f} psi")
             else:
                 st.error("ML prediction failed.")
             
             if p2_finder is not None:
-                st.success(f"p2 Finder Calculated p2: {p2_finder:.2f} psi")
+                st.success(f"Interpolation Calculated Bottomhole Flowing Pressure: {p2_finder:.2f} psi")
             else:
                 st.error("p2 Finder calculation failed.")
             
