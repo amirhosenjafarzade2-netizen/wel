@@ -12,9 +12,12 @@ import lightgbm as lgb
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Dense, Input
+import plotly.express as px
+import plotly.graph_objects as go
+from scipy.optimize import fsolve
 try:
     from config import PRODUCTION_RATES, GITHUB_URL
-    from utils import setup_logging
+    from utils import setup_logging, polynomial
     from random_point_generator import generate_df
     from validators import validate_conduit_size, validate_production_rate, get_valid_options, get_valid_glr_range, validate_glr, validate_positive_integer
 except ImportError as e:
@@ -143,7 +146,6 @@ def load_ml_data(reference_data, conduit_size, production_rate, num_points, glr=
                 if df_temp is None or df_temp.empty:
                     current_iteration += 1
                     continue
-                # Keep only necessary columns for prediction
                 if not all(col in df_temp.columns for col in ['p1', 'D', 'p2']):
                     logger.error(f"Generated DataFrame missing required columns: {df_temp.columns}")
                     current_iteration += 1
@@ -251,11 +253,91 @@ def predict_p2(model, scaler, p1, D, conduit_size, production_rate, glr):
         logger.error(f"Prediction error: {str(e)}")
         return None
 
+def calculate_p2_finder(reference_data, p1, D, conduit_size, production_rate, glr):
+    """
+    Calculate p2 using p2 Finder logic (polynomial-based from ui.py).
+    """
+    try:
+        # Find or interpolate coefficients
+        filtered_data = [
+            entry for entry in reference_data
+            if entry['conduit_size'] == conduit_size and entry['production_rate'] == production_rate
+        ]
+        if not filtered_data:
+            logger.error(f"No data for conduit_size={conduit_size}, production_rate={production_rate}")
+            return None
+        glrs = [entry['glr'] for entry in filtered_data]
+        if glr in glrs:
+            coeffs = next(entry['coefficients'] for entry in filtered_data if entry['glr'] == glr)
+        else:
+            glrs.sort()
+            if glr < glrs[0] or glr > glrs[-1]:
+                logger.error(f"GLR {glr} out of range for conduit_size={conduit_size}, production_rate={production_rate}")
+                return None
+            lower_glr = max([g for g in glrs if g <= glr], default=None)
+            upper_glr = min([g for g in glrs if g >= glr], default=None)
+            if lower_glr is None or upper_glr is None:
+                logger.error(f"Cannot interpolate GLR {glr}")
+                return None
+            lower_coeffs = next(entry['coefficients'] for entry in filtered_data if entry['glr'] == lower_glr)
+            upper_coeffs = next(entry['coefficients'] for entry in filtered_data if entry['glr'] == upper_glr)
+            weight = (glr - lower_glr) / (upper_glr - lower_glr)
+            coeffs = {key: lower_coeffs[key] + (upper_coeffs[key] - lower_coeffs[key]) * weight
+                      for key in lower_coeffs}
+        
+        # Calculate y1 = polynomial(p1)
+        y1 = polynomial(p1, coeffs)
+        if not np.isfinite(y1) or y1 < 0 or y1 > 31000:
+            logger.error(f"Invalid y1={y1} for p1={p1}")
+            return None
+        
+        # Calculate y2 = y1 + D
+        y2 = y1 + D
+        if y2 > 31000:
+            logger.error(f"y2={y2} exceeds max depth 31000")
+            return None
+        
+        # Solve polynomial(p2) = y2 for p2
+        def root_function(p2):
+            return polynomial(p2, coeffs) - y2
+        
+        p2_guess = p1 + 100
+        p2 = fsolve(root_function, p2_guess, maxfev=20000)[0]
+        if not np.isfinite(p2) or p2 < 0 or p2 > 4000:
+            logger.error(f"Invalid p2={p2}")
+            return None
+        
+        return p2
+    except Exception as e:
+        logger.error(f"Error in p2 Finder calculation: {str(e)}")
+        return None
+
 def run_ml_predictor():
     """
     UI for Bottomhole Pressure Predictor.
     """
     st.subheader("Mode 6: Bottomhole Pressure Predictor")
+    
+    # Apply theme from ui.py
+    theme = 'plotly_white'
+    if st.session_state.get('theme', 'light') == 'dark':
+        theme = 'plotly_dark'
+        st.markdown("""
+            <style>
+                .stApp {
+                    background-color: #1e1e1e;
+                    color: #ffffff;
+                }
+                .stTextInput > div > div > input, .stSelectbox > div > div > select {
+                    background-color: #333333;
+                    color: #ffffff;
+                }
+                .stButton > button {
+                    background-color: #4CAF50;
+                    color: white;
+                }
+            </style>
+        """, unsafe_allow_html=True)
     
     # Load reference data if not already loaded
     if 'reference_data' not in st.session_state:
@@ -372,9 +454,44 @@ def run_ml_predictor():
                 logger.error(f"Prediction errors: {errors}")
                 return
             
+            # ML Prediction
             p2_pred = predict_p2(st.session_state.model_pred, st.session_state.scaler_pred, 
                                pred_p1, pred_D, pred_conduit, pred_prod, pred_glr)
+            
+            # p2 Finder Calculation
+            p2_finder = calculate_p2_finder(st.session_state.reference_data, pred_p1, pred_D,
+                                          pred_conduit, pred_prod, pred_glr)
+            
             if p2_pred is not None:
-                st.success(f"Predicted Bottomhole Flowing Pressure (p2): {p2_pred:.2f} psi")
+                st.success(f"ML Predicted p2: {p2_pred:.2f} psi")
+            else:
+                st.error("ML prediction failed.")
+            
+            if p2_finder is not None:
+                st.success(f"p2 Finder Calculated p2: {p2_finder:.2f} psi")
+            else:
+                st.error("p2 Finder calculation failed.")
+            
+            # Plot comparison if both predictions are valid
+            if p2_pred is not None and p2_finder is not None:
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=[pred_p1], y=[p2_pred], mode='markers', name='ML Prediction',
+                    marker=dict(size=12, color='blue')
+                ))
+                fig.add_trace(go.Scatter(
+                    x=[pred_p1], y=[p2_finder], mode='markers', name='p2 Finder',
+                    marker=dict(size=12, color='red')
+                ))
+                fig.update_layout(
+                    title="p2 Comparison: ML Prediction vs p2 Finder",
+                    xaxis_title="Wellhead Pressure (p1, psi)",
+                    yaxis_title="Bottomhole Pressure (p2, psi)",
+                    template=theme,
+                    showlegend=True,
+                    width=600,
+                    height=400
+                )
+                st.plotly_chart(fig)
     else:
         st.warning("Please generate data and train the model before making predictions.")
