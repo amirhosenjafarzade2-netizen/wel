@@ -42,12 +42,12 @@ def main():
     # Mode selection
     st.header("Select Calculation Mode")
     mode_options = [
-        "p2 Finder",
+        "Bottomhole Pressure Predictor",
         "Natural Flow Finder",
         "GLR Graph Drawer",
         "Random Point Generator",
         "Machine Learning Analysis",
-        "Bottomhole Pressure Predictor"
+        "Machine Learning Bottomhole Pressure Predictor"
     ]
     previous_mode = st.session_state.mode_select
     mode = st.selectbox("Choose a mode:", mode_options, key="mode_select")
