@@ -1,0 +1,12 @@
+streamlit
+matplotlib
+pandas
+numpy
+scipy
+requests
+openpyxl
+xlsxwriter
+tensorflow
+scikit-learn
+deap
+lightgbm
