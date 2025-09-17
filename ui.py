@@ -616,36 +616,49 @@ def run_glr_graph_drawer(reference_data, interpolation_ranges, production_rates)
     if 'glr_graph_inputs' not in st.session_state:
         st.session_state.glr_graph_inputs = {
             'conduit_size': 2.875,
-            'production_rate': 100.0
+            'production_rate': 100.0,
+            'mode': 'color'  # Default to colorful mode
         }
     
     st.subheader("GLR Curves Inputs")
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        valid_conduits = [2.875, 3.5]
-        conduit_size = st.selectbox(
-            "Conduit Size (in):",
-            valid_conduits,
-            index=valid_conduits.index(st.session_state.glr_graph_inputs['conduit_size']),
-            key="glr_conduit",
-            help="Select the conduit size (2.875 or 3.5 inches)."
+    with st.form("glr_graph_form"):
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            valid_conduits = [2.875, 3.5]
+            conduit_size = st.selectbox(
+                "Conduit Size (in):",
+                valid_conduits,
+                index=valid_conduits.index(st.session_state.glr_graph_inputs['conduit_size']),
+                key="glr_conduit",
+                help="Select the conduit size (2.875 or 3.5 inches)."
+            )
+            st.session_state.glr_graph_inputs['conduit_size'] = conduit_size
+        
+        with col2:
+            valid_prates, _ = get_valid_options(conduit_size)
+            valid_prates = [float(pr) for pr in valid_prates]
+            production_rate = st.selectbox(
+                "Production Rate (stb/day):",
+                valid_prates,
+                index=valid_prates.index(st.session_state.glr_graph_inputs['production_rate']) if st.session_state.glr_graph_inputs['production_rate'] in valid_prates else 0,
+                key="glr_prate",
+                help="Select the production rate (50 to 600 stb/day)."
+            )
+            st.session_state.glr_graph_inputs['production_rate'] = production_rate
+        
+        # Add mode selection dropdown
+        mode = st.selectbox(
+            "Graph Style:",
+            ["Colorful", "Black and White"],
+            index=0 if st.session_state.glr_graph_inputs.get('mode', 'color') == 'color' else 1,
+            key="glr_mode",
+            help="Choose whether to display the GLR curves in color or black and white."
         )
-        st.session_state.glr_graph_inputs['conduit_size'] = conduit_size
-    
-    with col2:
-        valid_prates, _ = get_valid_options(conduit_size)
-        valid_prates = [float(pr) for pr in valid_prates]
-        production_rate = st.selectbox(
-            "Production Rate (stb/day):",
-            valid_prates,
-            index=valid_prates.index(st.session_state.glr_graph_inputs['production_rate']) if st.session_state.glr_graph_inputs['production_rate'] in valid_prates else 0,
-            key="glr_prate",
-            help="Select the production rate (50 to 600 stb/day)."
-        )
-        st.session_state.glr_graph_inputs['production_rate'] = production_rate
-    
-    plot_glr = st.button("Plot GLR Curves")
+        mode = 'color' if mode == "Colorful" else 'bw'
+        st.session_state.glr_graph_inputs['mode'] = mode
+        
+        plot_glr = st.form_submit_button("Plot GLR Curves")
     
     if plot_glr:
         with st.spinner("Generating GLR Curves..."):
@@ -661,8 +674,8 @@ def run_glr_graph_drawer(reference_data, interpolation_ranges, production_rates)
                 logger.error(f"GLR Graph Drawer errors: {errors}")
             else:
                 try:
-                    # Placeholder: Assume plot_glr_graphs returns (fig, glr_data)
-                    fig = plot_glr_graphs(reference_data, conduit_size, production_rate, mode='color')
+                    # Pass the selected mode to plot_glr_graphs
+                    fig = plot_glr_graphs(reference_data, conduit_size, production_rate, mode=mode)
                     glr_data = [...]  # Replace with actual glr_data from plot_glr_graphs
                     if fig is not None:
                         st.subheader("GLR Pressure vs Depth Curves")
